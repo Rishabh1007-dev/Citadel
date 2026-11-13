@@ -1,290 +1,127 @@
-import { useEffect, useMemo, useState } from "react";
-import { Activity, AlertTriangle, CircleDashed, Cpu, Gauge, HardDrive, MemoryStick, Wifi } from "lucide-react";
-import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Activity, AlertTriangle, Cpu, Gauge, MemoryStick, Wifi, X, Download, Play, Pause, ShieldCheck } from "lucide-react";
+import { Area, AreaChart, CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
-type NodeStatus = {
-  node_id: string;
-  status: string;
-  cpu_percent: number;
-  memory_mb: number;
-  latency_ms: number;
-  last_seen: string;
-  health_score: number;
-};
-
-type AlertItem = {
-  node_id: string;
-  metric: string;
-  severity: string;
-  value: number;
-  z_score: number;
-  timestamp: string;
-};
-
-const apiBase = "http://localhost:8000";
-
-const formatTime = (iso: string) => {
-  const date = new Date(iso);
-  return isNaN(date.getTime()) ? "--:--:--" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-};
-
-const getSeverityClasses = (severity: string) => {
-  if (severity === "CRITICAL") return "bg-red-500/15 text-red-300 border-red-500/30";
-  if (severity === "WARNING") return "bg-amber-500/15 text-amber-200 border-amber-500/30";
-  return "bg-slate-500/10 text-slate-200 border-slate-500/20";
-};
+type NodeStatus = { node_id: string; status: string; cpu_percent: number; memory_mb: number; latency_ms: number; last_seen: string; health_score: number; healing?: boolean };
+type AlertItem = { id: number; node_id: string; metric: string; severity: string; value: number; z_score: number; timestamp: string };
+type Frame = { node_id: string; timestamp: string; cpu_percent: number; memory_mb: number; latency_ms: number; z_scores?: Record<string, number> };
+type Report = { anomaly: AlertItem; root_cause: string; correlated_anomalies: AlertItem[]; pre_incident_snapshot: Frame[]; blast_radius: string[]; remediation_timeline: Array<{command: string; status: string; started_at: string; completed_at?: string | null; details: string}> };
+const apiBase = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:8000";
+const wsBase = apiBase.replace("https://", "wss://").replace("http://", "ws://");
+const colors = ["#a78bfa", "#38bdf8", "#34d399", "#f59e0b"];
+const formatTime = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const severityClass = (s: string) => s === "CRITICAL" ? "border-red-500/40 bg-red-500/10 text-red-200" : "border-amber-500/40 bg-amber-500/10 text-amber-100";
 
 function App() {
   const [nodes, setNodes] = useState<NodeStatus[]>([]);
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
-  const [selectedNode, setSelectedNode] = useState<string>("all");
   const [chartData, setChartData] = useState<Array<Record<string, any>>>([]);
+  const [selectedNode, setSelectedNode] = useState("all");
+  const [autoHeal, setAutoHeal] = useState(true);
+  const [report, setReport] = useState<Report | null>(null);
+  const [replayMode, setReplayMode] = useState(false);
+  const [frames, setFrames] = useState<Frame[]>([]);
+  const [replayIndex, setReplayIndex] = useState(0);
+  const [loadingReport, setLoadingReport] = useState(false);
 
-  useEffect(() => {
-    const ws = new WebSocket("ws://localhost:8000/ws/stream");
-
-    ws.onopen = () => {
-      console.info("Connected to telemetry stream");
-    };
-
-    ws.onmessage = (event) => {
-      const payload = JSON.parse(event.data);
-      if (payload.event === "snapshot" || payload.event === "telemetry" || payload.event === "fault-injection") {
-        if (payload.nodes) {
-          setNodes(payload.nodes);
-        }
-        if (payload.anomalies && payload.anomalies.length) {
-          setAlerts((current) => [
-            ...payload.anomalies.map((a: AlertItem) => ({ ...a, timestamp: a.timestamp ?? new Date().toISOString() })),
-            ...current,
-          ].slice(0, 25));
-        }
-      }
-
-      if (payload.nodes) {
-        const now = new Date().toISOString();
-        const nextPoint = {
-          time: formatTime(now),
-          ...Object.fromEntries(payload.nodes.map((node: NodeStatus) => [node.node_id, node.cpu_percent])),
-        };
-        setChartData((current) => [...current, nextPoint].slice(-24));
-      }
-    };
-
-    ws.onerror = () => {
-      console.error("WebSocket error");
-    };
-
-    return () => ws.close();
+  const addFrame = useCallback((incoming: NodeStatus[], timestamp = new Date().toISOString()) => {
+    setChartData(old => [...old, { time: formatTime(timestamp), ...Object.fromEntries(incoming.map(n => [n.node_id, n.cpu_percent])) }].slice(-180));
   }, []);
 
   useEffect(() => {
-    const fetchNodes = async () => {
-      try {
-        const res = await fetch(`${apiBase}/api/v1/nodes`);
-        const data = await res.json();
-        setNodes(data.nodes || []);
-      } catch (_error) {
-        console.warn("could not fetch nodes");
-      }
+    let ws: WebSocket;
+    let reconnect: number;
+    let disposed = false;
+    const connect = () => {
+      ws = new WebSocket(`${wsBase}/ws/stream`);
+      ws.onmessage = event => {
+        const message = JSON.parse(event.data);
+        if (message.auto_heal_enabled !== undefined) setAutoHeal(message.auto_heal_enabled);
+        if (message.nodes) {
+          setNodes(message.nodes);
+          if (!replayMode) addFrame(message.nodes, message.timestamp);
+        }
+        if (message.anomalies?.length) setAlerts(old => [...message.anomalies, ...old].filter((a: AlertItem, i: number, all: AlertItem[]) => all.findIndex(x => x.id === a.id) === i).slice(0, 40));
+      };
+      ws.onclose = () => { if (!disposed) reconnect = window.setTimeout(connect, 1500); };
     };
+    connect();
+    return () => { disposed = true; window.clearTimeout(reconnect); ws?.close(); };
+  }, [addFrame, replayMode]);
 
-    const fetchAlerts = async () => {
-      try {
-        const res = await fetch(`${apiBase}/api/v1/anomalies?page=1&page_size=20`);
-        const data = await res.json();
-        setAlerts(data.items || []);
-      } catch (_error) {
-        console.warn("could not fetch alerts");
-      }
-    };
-
-    fetchNodes();
-    fetchAlerts();
+  useEffect(() => {
+    fetch(`${apiBase}/api/v1/anomalies?page=1&page_size=30`).then(r => r.json()).then(data => setAlerts(data.items ?? [])).catch(() => undefined);
   }, []);
 
-  const filteredNodes = useMemo(
-    () => (selectedNode === "all" ? nodes : nodes.filter((node) => node.node_id === selectedNode)),
-    [nodes, selectedNode],
-  );
+  const toggleAutoHeal = async () => {
+    try {
+      const response = await fetch(`${apiBase}/api/v1/auto-heal?enabled=${!autoHeal}`, { method: "POST" });
+      if (!response.ok) throw new Error("Unable to update auto-heal setting");
+      setAutoHeal(!autoHeal);
+    } catch (error) { console.error(error); }
+  };
 
-  const totals = useMemo(() => {
-    const avgLatency = nodes.length
-      ? nodes.reduce((sum, node) => sum + node.latency_ms, 0) / nodes.length
-      : 0;
-    const avgHealth = nodes.length
-      ? nodes.reduce((sum, node) => sum + node.health_score, 0) / nodes.length
-      : 100;
-    const criticalCount = alerts.filter((alert) => alert.severity === "CRITICAL").length;
-    return {
-      activeNodes: nodes.length,
-      latency: avgLatency,
-      healthScore: Math.round(avgHealth),
-      criticalAlerts: criticalCount,
-    };
-  }, [nodes, alerts]);
+  const loadReplay = async () => {
+    try {
+      const response = await fetch(`${apiBase}/api/v1/replay?minutes=5`);
+      const data = await response.json();
+      setFrames(data.frames ?? []);
+      setReplayIndex(Math.max(0, (data.frames ?? []).length - 1));
+      setReplayMode(true);
+    } catch (error) { console.error(error); }
+  };
 
-  return (
-    <div className="min-h-screen bg-bg p-6 text-zinc-100">
-      <div className="mx-auto max-w-7xl">
-        <header className="mb-6 flex items-center justify-between">
-          <div>
-            <p className="text-xs uppercase tracking-[0.28em] text-violet-300">Citadel</p>
-            <h1 className="mt-2 text-3xl font-semibold">System Telemetry Command Center</h1>
-          </div>
-          <div className="rounded-full border border-violet-500/40 bg-violet-500/10 px-4 py-2 text-sm text-violet-200">
-            <span className="inline-flex items-center gap-2"><CircleDashed className="h-4 w-4" /> Live data stream</span>
-          </div>
-        </header>
+  const replayNodes = useMemo(() => {
+    if (!replayMode || !frames.length) return nodes;
+    const timestamp = frames[replayIndex]?.timestamp;
+    const pointFrames = frames.filter(frame => frame.timestamp === timestamp);
+    return pointFrames.map(frame => ({ ...frame, status: "replay", last_seen: frame.timestamp, health_score: 100 } as NodeStatus));
+  }, [frames, nodes, replayIndex, replayMode]);
+  const displayedNodes = replayMode ? replayNodes : nodes;
+  const selected = selectedNode === "all" ? displayedNodes : displayedNodes.filter(n => n.node_id === selectedNode);
+  const averages = displayedNodes.length ? displayedNodes.reduce((sum, n) => sum + n.latency_ms, 0) / displayedNodes.length : 0;
+  const health = displayedNodes.length ? Math.round(displayedNodes.reduce((sum, n) => sum + n.health_score, 0) / displayedNodes.length) : 100;
+  const critical = alerts.filter(a => a.severity === "CRITICAL").length;
 
-        <section className="mb-6 grid gap-4 md:grid-cols-4">
-          <MetricCard icon={<Activity className="h-5 w-5" />} label="Active Nodes" value={String(totals.activeNodes)} hint="across 4 clusters" />
-          <MetricCard icon={<Gauge className="h-5 w-5" />} label="Global Avg Latency" value={`${totals.latency.toFixed(0)} ms`} hint="rolling 30s" />
-          <MetricCard icon={<Cpu className="h-5 w-5" />} label="System Health Score" value={`${totals.healthScore}%`} hint="anomaly weighted" />
-          <MetricCard icon={<AlertTriangle className="h-5 w-5" />} label="Active Critical Alerts" value={String(totals.criticalAlerts)} hint="root-cause view" />
-        </section>
+  const openReport = async (alert: AlertItem) => {
+    if (!alert.id) return;
+    setLoadingReport(true);
+    try { const response = await fetch(`${apiBase}/api/v1/anomalies/${alert.id}/postmortem`); if (!response.ok) throw new Error("Report unavailable"); setReport(await response.json()); }
+    catch (error) { console.error(error); }
+    finally { setLoadingReport(false); }
+  };
 
-        <section className="mb-6 rounded-2xl border border-border bg-panel p-4 shadow-glow">
-          <div className="mb-4 flex items-center justify-between">
-            <div>
-              <p className="text-sm uppercase tracking-[0.2em] text-zinc-400">Live multi-node telemetry</p>
-              <h2 className="mt-2 text-xl font-semibold">Resource intensity and error patterns</h2>
-            </div>
-            <div className="flex gap-2">
-              <button className={`rounded-lg border px-3 py-2 text-sm ${selectedNode === "all" ? "border-violet-500/50 bg-violet-500/15 text-violet-100" : "border-border bg-panelAlt text-zinc-300"}`} onClick={() => setSelectedNode("all")}>All Nodes</button>
-              {nodes.map((node) => (
-                <button key={node.node_id} className={`rounded-lg border px-3 py-2 text-sm ${selectedNode === node.node_id ? "border-violet-500/50 bg-violet-500/15 text-violet-100" : "border-border bg-panelAlt text-zinc-300"}`} onClick={() => setSelectedNode(node.node_id)}>{node.node_id}</button>
-              ))}
-            </div>
-          </div>
+  const downloadReport = () => {
+    if (!report) return;
+    const body = `# Incident Post-Mortem — ${report.anomaly.node_id}\n\n- **Incident:** ${report.anomaly.metric} (${report.anomaly.severity})\n- **Timestamp:** ${report.anomaly.timestamp}\n- **Value / Z-score:** ${report.anomaly.value} / ${report.anomaly.z_score}\n\n## Root cause analysis\n${report.root_cause}\n\n## Blast radius\n${report.blast_radius.map(node => `- ${node}`).join("\n")}\n\n## Pre-incident snapshot\n${report.pre_incident_snapshot.map(row => `- ${row.node_id}: CPU ${row.cpu_percent}%, memory ${row.memory_mb} MB, latency ${row.latency_ms} ms at ${row.timestamp}`).join("\n")}\n\n## Remediation timeline\n${report.remediation_timeline.length ? report.remediation_timeline.map(item => `- ${item.started_at}: ${item.command} — ${item.status}${item.completed_at ? ` (completed ${item.completed_at})` : ""}`).join("\n") : "- No remediation recorded."}\n`;
+    const url = URL.createObjectURL(new Blob([body], { type: "text/markdown" }));
+    const link = document.createElement("a"); link.href = url; link.download = `citadel-incident-${report.anomaly.id}.md`; link.click(); URL.revokeObjectURL(url);
+  };
 
-          <div className="h-72 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke="#27272a" strokeDasharray="6 6" />
-                <XAxis dataKey="time" stroke="#71717a" />
-                <YAxis stroke="#71717a" domain={[0, 100]} />
-                <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 12 }} />
-                {filteredNodes.length ? filteredNodes.map((node) => (
-                  <Line key={node.node_id} type="monotone" dataKey={node.node_id} stroke={node.node_id.includes("db") ? "#f59e0b" : node.node_id.includes("eu") ? "#38bdf8" : node.node_id.includes("ap") ? "#22c55e" : "#a78bfa"} strokeWidth={2.5} dot={false} />
-                )) : <Line dataKey="system" stroke="#a78bfa" dot={false} />}
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </section>
-
-        <section className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
-          <div className="rounded-2xl border border-border bg-panel p-4">
-            <div className="mb-4 flex items-center justify-between">
-              <h3 className="text-xl font-semibold">Node status grid</h3>
-              <span className="text-xs uppercase tracking-[0.2em] text-zinc-400">Live</span>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              {nodes.length ? nodes.map((node) => (
-                <NodeCard key={node.node_id} node={node} />
-              )) : <div className="rounded-xl border border-dashed border-border p-8 text-center text-zinc-500">Waiting for telemetry...</div>}
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-border bg-panel p-4">
-            <div className="mb-4 flex items-center justify-between">
-              <h3 className="text-xl font-semibold">Anomaly alert feed</h3>
-              <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-1 text-xs uppercase tracking-[0.2em] text-red-200">{alerts.filter((a) => a.severity === "CRITICAL").length} critical</span>
-            </div>
-            <div className="space-y-3">
-              {alerts.length ? alerts.slice(0, 10).map((alert, idx) => (
-                <div key={`${alert.node_id}-${alert.metric}-${idx}`} className={`rounded-xl border p-3 ${getSeverityClasses(alert.severity)}`}>
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <p className="font-medium">{alert.node_id}</p>
-                    <span className="text-xs uppercase tracking-[0.18em]">{alert.severity}</span>
-                  </div>
-                  <p className="text-sm text-zinc-200">{alert.metric} breached z-score threshold</p>
-                  <div className="mt-2 flex items-center justify-between text-xs text-zinc-300">
-                    <span>z={alert.z_score.toFixed(2)}</span>
-                    <span>{formatTime(alert.timestamp)}</span>
-                  </div>
-                </div>
-              )) : <div className="rounded-xl border border-dashed border-border p-8 text-center text-zinc-500">No active anomalies</div>}
-            </div>
-          </div>
-        </section>
-      </div>
+  return <main className="min-h-screen bg-bg p-5 text-zinc-100 md:p-8">
+    <div className="mx-auto max-w-[1500px]">
+      <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
+        <div><p className="text-xs uppercase tracking-[.28em] text-violet-300">Citadel / observability</p><h1 className="mt-2 text-3xl font-semibold">System Command Center</h1><p className="mt-1 text-sm text-zinc-500">Real-time telemetry · autonomous incident response</p></div>
+        <button onClick={toggleAutoHeal} className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium ${autoHeal ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200" : "border-zinc-700 bg-zinc-900 text-zinc-300"}`}><ShieldCheck size={17}/> Auto-Heal: {autoHeal ? "ON" : "OFF"}</button>
+      </header>
+      <section className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Kpi icon={<Activity/>} label="Active nodes" value={`${displayedNodes.length}`} /><Kpi icon={<Gauge/>} label="Global avg latency" value={`${averages.toFixed(0)} ms`} /><Kpi icon={<Cpu/>} label="System health" value={`${health}%`} /><Kpi icon={<AlertTriangle/>} label="Critical alerts" value={`${critical}`} />
+      </section>
+      <Topology nodes={displayedNodes}/>
+      <section className="my-5 rounded-2xl border border-border bg-panel p-4">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3"><div><div className="text-xs uppercase tracking-[.2em] text-zinc-500">Live telemetry</div><h2 className="mt-1 text-lg font-semibold">CPU utilization by node</h2></div><div className="flex flex-wrap gap-2"><button onClick={() => setSelectedNode("all")} className={tabClass(selectedNode === "all")}>All nodes</button>{nodes.map(n => <button key={n.node_id} onClick={() => setSelectedNode(n.node_id)} className={tabClass(selectedNode === n.node_id)}>{n.node_id}</button>)}</div></div>
+        <div className="h-72"><ResponsiveContainer width="100%" height="100%"><LineChart data={chartData}><CartesianGrid stroke="#27272a" strokeDasharray="5 5"/><XAxis dataKey="time" stroke="#71717a"/><YAxis domain={[0,100]} stroke="#71717a"/><Tooltip contentStyle={{background:"#18181b",border:"1px solid #27272a",borderRadius:10}}/><ReferenceLine y={92} stroke="#ef4444" strokeDasharray="4 4" label="Critical"/>{(selected.length ? selected : nodes).map(n => <Line key={n.node_id} dataKey={n.node_id} stroke={colors[Math.max(0,nodes.findIndex(x => x.node_id === n.node_id)) % colors.length]} dot={false} type="monotone" strokeWidth={2}/>)}</LineChart></ResponsiveContainer></div>
+      </section>
+      <section className="grid gap-5 xl:grid-cols-[1.4fr_.8fr]"><div className="rounded-2xl border border-border bg-panel p-4"><h2 className="mb-4 text-lg font-semibold">Node health matrix</h2><div className="grid gap-3 md:grid-cols-2">{displayedNodes.map(n => <NodeCard key={n.node_id} node={n}/>)}</div>{!displayedNodes.length && <p className="p-8 text-center text-zinc-500">Waiting for telemetry…</p>}</div>
+        <div className="rounded-2xl border border-border bg-panel p-4"><div className="mb-4 flex items-center justify-between"><h2 className="text-lg font-semibold">Live anomaly feed</h2><span className="text-xs text-zinc-500">Select an incident for analysis</span></div><div className="max-h-[560px] space-y-2 overflow-auto">{alerts.map((a, i) => <button key={a.id ?? `${a.node_id}-${i}`} onClick={() => openReport(a)} className={`block w-full rounded-xl border p-3 text-left transition hover:brightness-125 ${severityClass(a.severity)}`}><div className="flex justify-between gap-2"><b>{a.node_id}</b><span className="text-xs tracking-wider">{a.severity}</span></div><div className="mt-1 text-sm">{a.metric} · {a.value} · z={Number(a.z_score).toFixed(2)}</div><div className="mt-1 text-xs opacity-70">{formatTime(a.timestamp)} · Incident #{a.id ?? "pending"}</div></button>)}{!alerts.length && <p className="p-8 text-center text-zinc-500">No anomalies detected.</p>}</div></div></section>
+      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-[#111113]/95 px-5 py-3 backdrop-blur"><div className="mx-auto flex max-w-[1500px] flex-wrap items-center gap-4"><button onClick={() => replayMode ? setReplayMode(false) : void loadReplay()} className="inline-flex items-center gap-2 rounded-lg border border-border bg-panel px-3 py-2 text-sm">{replayMode ? <><Play size={15}/> Go Live</> : <><Pause size={15}/> Replay</>}</button><span className={`text-xs font-semibold uppercase tracking-widest ${replayMode ? "text-amber-300" : "text-emerald-300"}`}>{replayMode ? "Replay mode" : "Live mode"}</span>{replayMode && <><input aria-label="Replay timestamp" className="min-w-40 flex-1 accent-violet-500" type="range" min={0} max={Math.max(0,frames.length-1)} value={replayIndex} onChange={e => setReplayIndex(Number(e.target.value))}/><span className="min-w-40 font-mono text-xs text-zinc-400">{frames[replayIndex] ? formatTime(frames[replayIndex].timestamp) : "No frames"} · {frames.length} frames</span></>}</div></div>
+      {(report || loadingReport) && <div className="fixed inset-0 z-40 flex justify-end bg-black/60" onClick={() => setReport(null)}><aside className="h-full w-full max-w-xl overflow-y-auto border-l border-border bg-[#111113] p-6 shadow-2xl" onClick={e => e.stopPropagation()}><div className="mb-6 flex items-start justify-between"><div><p className="text-xs uppercase tracking-widest text-violet-300">Incident analysis</p><h2 className="mt-1 text-xl font-semibold">Post-mortem report</h2></div><button aria-label="Close report" onClick={() => setReport(null)} className="rounded-lg border border-border p-2"><X size={18}/></button></div>{loadingReport ? <p className="text-zinc-400">Analyzing incident…</p> : report && <><div className={`rounded-xl border p-4 ${severityClass(report.anomaly.severity)}`}><div className="font-semibold">{report.anomaly.node_id} · {report.anomaly.metric}</div><div className="mt-2 font-mono text-sm">{report.anomaly.value} · Z {report.anomaly.z_score} · {report.anomaly.timestamp}</div></div><Section title="Deterministic root-cause analysis"><p>{report.root_cause}</p>{report.correlated_anomalies.map((a,i)=><p key={i} className="mt-2 text-xs text-zinc-400">{a.timestamp} — {a.node_id}: {a.metric} ({a.severity})</p>)}</Section><Section title="Blast radius"><div className="flex flex-wrap gap-2">{report.blast_radius.map(n=><span key={n} className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs text-cyan-100">{n}</span>)}</div></Section><Section title="Pre-incident metric snapshot">{report.pre_incident_snapshot.length ? report.pre_incident_snapshot.map(f=><div key={f.node_id} className="mb-2 rounded-lg bg-zinc-900 p-3 text-xs"><b>{f.node_id}</b><div className="mt-1 font-mono text-zinc-300">CPU {f.cpu_percent}% · RAM {f.memory_mb} MB · latency {f.latency_ms} ms</div><div className="mt-1 text-zinc-500">{f.timestamp}</div></div>) : <p>No telemetry frames in the incident window.</p>}</Section><Section title="Automated remediation timeline">{report.remediation_timeline.length ? report.remediation_timeline.map(r=><div key={`${r.started_at}-${r.command}`} className="mb-2 border-l-2 border-cyan-500 pl-3"><b className="text-cyan-200">{r.command}</b><p className="text-xs text-zinc-400">{r.started_at} · {r.status}{r.completed_at ? ` · completed ${r.completed_at}` : ""}</p><p className="text-xs text-zinc-500">{r.details}</p></div>) : <p>No remediation action recorded for this incident.</p>}</Section><button onClick={downloadReport} className="mt-4 inline-flex items-center gap-2 rounded-lg bg-violet-600 px-4 py-3 text-sm font-semibold hover:bg-violet-500"><Download size={16}/> Download Incident Report (.md)</button></>}</aside></div>}
     </div>
-  );
+  </main>;
 }
-
-function MetricCard({ icon, label, value, hint }: { icon: React.ReactNode; label: string; value: string; hint: string }) {
-  return (
-    <div className="rounded-2xl border border-border bg-panel p-4">
-      <div className="mb-3 flex items-center justify-between text-violet-300">{icon}</div>
-      <div className="text-sm text-zinc-400">{label}</div>
-      <div className="mt-1 font-mono text-3xl font-semibold">{value}</div>
-      <div className="mt-2 text-xs text-zinc-500">{hint}</div>
-    </div>
-  );
-}
-
-function NodeCard({ node }: { node: NodeStatus }) {
-  const sparkline = [
-    { value: Math.max(0, node.cpu_percent - 10) },
-    { value: node.cpu_percent },
-    { value: Math.min(100, node.cpu_percent + 8) },
-    { value: Math.max(0, node.cpu_percent - 16) },
-    { value: node.cpu_percent },
-  ];
-
-  return (
-    <div className="rounded-xl border border-border bg-panelAlt p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <div>
-          <p className="font-medium text-zinc-200">{node.node_id}</p>
-          <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">{node.status}</p>
-        </div>
-        <span className={`rounded-full px-2 py-1 text-xs ${node.status === "critical" ? "bg-red-500/15 text-red-300" : node.status === "warning" ? "bg-amber-500/15 text-amber-200" : "bg-emerald-500/15 text-emerald-300"}`}>
-          {node.health_score}%
-        </span>
-      </div>
-
-      <div className="mb-4 h-12 w-full">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={sparkline}>
-            <defs>
-              <linearGradient id={`grad-${node.node_id}`} x1="0" x2="0" y1="0" y2="1">
-                <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.9} />
-                <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.1} />
-              </linearGradient>
-            </defs>
-            <Area type="monotone" dataKey="value" stroke="#8b5cf6" fill={`url(#grad-${node.node_id})`} strokeWidth={2} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-
-      <div className="grid grid-cols-3 gap-2 text-sm">
-        <div className="rounded-lg border border-border bg-bg/60 p-2">
-          <div className="flex items-center gap-2 text-zinc-400"><Cpu className="h-3.5 w-3.5" /> CPU</div>
-          <div className="mt-2 font-mono text-lg">{node.cpu_percent.toFixed(1)}%</div>
-        </div>
-        <div className="rounded-lg border border-border bg-bg/60 p-2">
-          <div className="flex items-center gap-2 text-zinc-400"><MemoryStick className="h-3.5 w-3.5" /> RAM</div>
-          <div className="mt-2 font-mono text-lg">{node.memory_mb.toFixed(0)} MB</div>
-        </div>
-        <div className="rounded-lg border border-border bg-bg/60 p-2">
-          <div className="flex items-center gap-2 text-zinc-400"><Wifi className="h-3.5 w-3.5" /> Latency</div>
-          <div className="mt-2 font-mono text-lg">{node.latency_ms.toFixed(0)} ms</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
+function tabClass(active: boolean) { return `rounded-lg border px-3 py-2 text-xs ${active ? "border-violet-500/50 bg-violet-500/15 text-violet-100" : "border-border bg-panelAlt text-zinc-300"}`; }
+function Kpi({icon,label,value}:{icon:React.ReactNode;label:string;value:string}) { return <div className="rounded-2xl border border-border bg-panel p-4"><div className="mb-3 text-violet-300">{icon}</div><div className="text-sm text-zinc-400">{label}</div><div className="mt-1 font-mono text-3xl font-semibold">{value}</div></div>; }
+function NodeCard({node}:{node:NodeStatus}) { const color = node.healing ? "#06b6d4" : node.status === "critical" ? "#ef4444" : node.status === "warning" ? "#f59e0b" : "#10b981"; return <div className="rounded-xl border border-border bg-panelAlt p-4"><div className="mb-3 flex justify-between"><div><b>{node.node_id}</b><p className="text-xs uppercase text-zinc-500">{node.healing ? "self-healing" : node.status}</p></div><span className="font-mono" style={{color}}>{node.health_score}%</span></div><div className="mb-3 h-12"><ResponsiveContainer width="100%" height="100%"><AreaChart data={[node.cpu_percent-8,node.cpu_percent-3,node.cpu_percent,node.cpu_percent+2,node.cpu_percent].map(value=>({value}))}><Area dataKey="value" stroke={color} fill={color} fillOpacity={.16}/></AreaChart></ResponsiveContainer></div><div className="grid grid-cols-3 gap-2 text-xs"><span><Cpu size={13} className="inline"/> {node.cpu_percent.toFixed(1)}%</span><span><MemoryStick size={13} className="inline"/> {node.memory_mb.toFixed(0)} MB</span><span><Wifi size={13} className="inline"/> {node.latency_ms.toFixed(0)} ms</span></div></div>; }
+function Section({title,children}:{title:string;children:React.ReactNode}) { return <section className="mt-6"><h3 className="mb-3 text-sm font-semibold uppercase tracking-wider text-zinc-300">{title}</h3><div className="text-sm leading-6 text-zinc-400">{children}</div></section>; }
+function Topology({nodes}:{nodes:NodeStatus[]}) { const colorFor = (id:string) => {const node=nodes.find(n=>n.node_id===id); return node?.healing ? "#06b6d4" : node?.status === "critical" ? "#ef4444" : node?.status === "warning" ? "#f59e0b" : "#10b981";}; const regional=["us-east-node-1","eu-central-node-2","ap-south-node-3"]; return <section className="rounded-2xl border border-border bg-panel p-4"><div className="mb-2 flex items-center justify-between"><div><p className="text-xs uppercase tracking-[.2em] text-zinc-500">Live traffic map</p><h2 className="text-lg font-semibold">Service topology</h2></div><div className="flex gap-3 text-[10px] text-zinc-400"><span className="text-emerald-400">● Healthy</span><span className="text-amber-400">● Warning</span><span className="text-red-400">● Critical</span><span className="text-cyan-400">● Healing</span></div></div><div className="overflow-x-auto"><svg viewBox="0 0 1000 220" className="min-w-[700px] w-full" role="img" aria-label="Traffic flow from API gateway through regional nodes to primary database"><defs>{regional.map(id=><marker key={id} id={`arrow-${id}`} markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill={colorFor(id)}/></marker>)}</defs><rect x="30" y="82" width="155" height="56" rx="13" fill="#202024" stroke="#8b5cf6"/><text x="107" y="116" fill="#f4f4f5" textAnchor="middle" fontSize="14">API Gateway</text>{regional.map((id,i)=>{const y=25+i*70;const color=colorFor(id);return <g key={id}><path d={`M185 110 C245 110 235 ${y+27} 300 ${y+27}`} fill="none" stroke={color} strokeWidth="2" markerEnd={`url(#arrow-${id})`} opacity=".8"/><circle r="4" fill={color}><animateMotion dur={`${1.5+i*.25}s`} repeatCount="indefinite" path={`M185 110 C245 110 235 ${y+27} 300 ${y+27}`}/></circle><rect x="305" y={y} width="220" height="54" rx="12" fill="#202024" stroke={color} strokeWidth="2" className={color==="#ef4444"?"critical-node":""}/><text x="415" y={y+23} fill="#f4f4f5" textAnchor="middle" fontSize="12">{id}</text><text x="415" y={y+40} fill={color} textAnchor="middle" fontSize="10">{nodes.find(n=>n.node_id===id)?.status ?? "awaiting telemetry"}</text><path d={`M525 ${y+27} C620 ${y+27} 610 110 715 110`} fill="none" stroke={colorFor("db-primary-01")} strokeWidth="2" markerEnd="url(#arrow-${id})" opacity=".8"/><circle r="4" fill={colorFor("db-primary-01")}><animateMotion dur={`${1.8+i*.2}s`} repeatCount="indefinite" path={`M525 ${y+27} C620 ${y+27} 610 110 715 110`}/></circle></g>;})}<rect x="720" y="82" width="235" height="56" rx="13" fill="#202024" stroke={colorFor("db-primary-01")} strokeWidth="2"/><text x="837" y="106" fill="#f4f4f5" textAnchor="middle" fontSize="13">Primary Database</text><text x="837" y="124" fill={colorFor("db-primary-01")} textAnchor="middle" fontSize="10">db-primary-01</text></svg></div></section>; }
 export default App;
